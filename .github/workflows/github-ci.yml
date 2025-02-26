@@ -1,0 +1,112 @@
+name: Semantic Versioning
+
+on:
+  push:
+    branches:
+      - main # or master, depending on your default branch
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Type of version bump (patch, minor, major)"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  semver:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: get_latest_tag
+        run: |
+          git fetch --tags
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+
+      - name: Determine version bump
+        id: version_bump
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Use the manually specified bump type
+            echo "BUMP_TYPE=${{ github.event.inputs.bump_type }}" >> $GITHUB_ENV
+          else
+            # Get commit messages since last tag
+            commits=$(git log ${{ env.LATEST_TAG }}..HEAD --pretty=format:"%s")
+
+            # Initialize bump type
+            bump_type="patch"  # default to patch bump
+
+            # Check commit messages for keywords
+            while IFS= read -r commit; do
+              if [[ "$commit" == *"BREAKING CHANGE"* ]] || [[ "$commit" == *"!:"* ]] || [[ "$commit" == *"major:"* ]]; then
+                bump_type="major"
+                break
+              elif [[ "$commit" == *"feat:"* ]] || [[ "$commit" == *"minor:"* ]]; then
+                bump_type="minor"
+              fi
+            done <<< "$commits"
+
+            echo "BUMP_TYPE=$bump_type" >> $GITHUB_ENV
+          fi
+
+      - name: Bump version
+        id: bump_version
+        run: |
+          current_version=${LATEST_TAG#v}  # Remove 'v' prefix
+          IFS='.' read -r major minor patch <<< "$current_version"
+
+          case ${{ env.BUMP_TYPE }} in
+            "major")
+              new_version="$((major + 1)).0.0"
+              ;;
+            "minor")
+              new_version="$major.$((minor + 1)).0"
+              ;;
+            *)
+              new_version="$major.$minor.$((patch + 1))"
+              ;;
+          esac
+
+          echo "NEW_VERSION=v$new_version" >> $GITHUB_ENV
+
+      - name: Create and push tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git tag -a ${{ env.NEW_VERSION }} -m "Release ${{ env.NEW_VERSION }}"
+          git push origin ${{ env.NEW_VERSION }}
+
+      - name: Create release zip
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && (env.BUMP_TYPE == 'minor' || env.BUMP_TYPE == 'major')
+        run: |
+          mkdir -p release
+          cp toolbox_script.py release/
+          cp README.md release/
+          cd release
+          zip -r ../toolbox_script_${{ env.NEW_VERSION }}.zip .
+          cd ..
+
+      - name: Create GitHub Release
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && (env.BUMP_TYPE == 'minor' || env.BUMP_TYPE == 'major')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: toolbox_script_${{ env.NEW_VERSION }}.zip
+          tag_name: ${{ env.NEW_VERSION }}
+          name: "Release ${{ env.NEW_VERSION }}"
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
