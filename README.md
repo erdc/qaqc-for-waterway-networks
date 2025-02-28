@@ -24,7 +24,7 @@ After a user introduces desired changes to a line layer representing the waterwa
 
 ### Prerequisites
 
-1. Install QGIS
+1. Install QGIS ([3.34.X](https://ftp.osuosl.org/pub/osgeo/download/qgis/windows/QGIS-OSGeo4W-3.34.15-1.msi))
 
 ### How to run
 
