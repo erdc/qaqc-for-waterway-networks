@@ -8,6 +8,12 @@ Magdalena Asborno, PhD
 Senior Consultant, ARA  
 Research Civil Engineer, USACE-ERDC
 
+## Cite this work
+
+If you use this work, please add this citation:
+
+Asborno, M., C. Hicks, and K. N. Mitchell. 2025. Quality Control for Waterway Network ERDC/CHL CHETN-IX-##. Vicksburg, MS: US Army Engineer Research and Development Center, Coastal and Hydraulics Laboratory. DOI forthcoming
+
 ## About
 
 The "Quality Control for Waterway Networks" Process is an automated process to update the U.S. Army Corps of Engineer’s (USACE) Engineer Research and Development Center (ERDC) Waterway Network.
