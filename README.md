@@ -14,6 +14,17 @@ If you use this work, please add this citation:
 
 Asborno, M., C. Hicks, and K. N. Mitchell. 2025. Quality Control for Waterway Network ERDC/CHL CHETN-IX-##. Vicksburg, MS: US Army Engineer Research and Development Center, Coastal and Hydraulics Laboratory. DOI forthcoming
 
+## Licensing
+
+This project is primarily licensed under GPL-3.0.
+
+However, this repository includes code derived from:
+
+- [disconnected-islands](https://github.com/AfriGIS-South-Africa/disconnected-islands) (MIT License)
+- [Networks](https://github.com/crocovert/networks) by crocovert (GPL-3.0 License)
+
+See the LICENSE file for the full GPL-3.0 license text and LICENSE-MIT.txt for the MIT license text.
+
 ## About
 
 The "Quality Control for Waterway Networks" Process is an automated process to update the U.S. Army Corps of Engineer’s (USACE) Engineer Research and Development Center (ERDC) Waterway Network.

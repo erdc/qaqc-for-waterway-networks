@@ -163,6 +163,10 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
         if feedback.isCanceled():
             return {} 
         
+
+        # Class DisconnectedIslands modified from disconnected-islands
+        # Copyright (c) 2024 Peter Smythe (https://github.com/AfriGIS-South-Africa/disconnected-islands)
+        # Licensed under MIT
         class DisconnectedIslands(object):
             def __init__(self, l):
                 self.layer = l
@@ -203,6 +207,9 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                 self.layer.commitChanges()
                 return (self.layer, [i for i in set(fid_comp.values()) if i > 0])
 
+        # Class Networks modified from networks
+        # Copyright (c) [2025] crocovert (https://github.com/crocovert)
+        # Licensed under GPL-3.0
         class Networks(QgsProcessingAlgorithm):
 
             def build_graph(self, parameters):       
