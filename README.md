@@ -12,7 +12,7 @@ Research Civil Engineer, USACE-ERDC
 
 If you use this work, please add this citation:
 
-Asborno, M., C. Hicks, and K. N. Mitchell. 2025. Quality Control for Waterway Network ERDC/CHL CHETN-IX-##. Vicksburg, MS: US Army Engineer Research and Development Center, Coastal and Hydraulics Laboratory. DOI forthcoming
+Asborno, M., C. Hicks, and K. N. Mitchell. 2025. Quality Control for Waterway Network ERDC/CHL CHETN-IX-22677. Vicksburg, MS: US Army Engineer Research and Development Center, Coastal and Hydraulics Laboratory. DOI forthcoming
 
 ## Licensing
 
