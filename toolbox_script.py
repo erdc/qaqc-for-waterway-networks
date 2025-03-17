@@ -2,16 +2,14 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing, QgsProcessingAlgorithm, QgsProcessingParameterDistance, QgsProcessingParameterFeatureSource, 
                        QgsProcessingParameterNumber, QgsProcessingParameterBoolean, QgsProcessingOutputString, QgsGeometry,
                        QgsFeature, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsField, QgsProject, QgsWkbTypes,
-                       QgsVectorLayer, QgsPointXY, QgsSpatialIndex, QgsRectangle, QgsUnitTypes, QgsFeatureRequest,
-                       QgsVectorLayerUtils, QgsDistanceArea, QgsProcessingFeatureSourceDefinition, QgsProcessingException,
-                       DEFAULT_SEGMENT_EPSILON, NULL, QgsProcessingParameterDefinition, QgsProcessingParameterField,
-                       QgsVectorFileWriter, QgsFeatureSink, QgsProcessingUtils, QgsProperty, QgsProcessingParameterFeatureSink)
+                       QgsVectorLayer, QgsPointXY, QgsSpatialIndex, QgsUnitTypes, QgsFeatureRequest, QgsVectorLayerUtils, QgsDistanceArea,
+                       QgsProcessingFeatureSourceDefinition, QgsProcessingException, QgsProcessingParameterDefinition,
+                       QgsProcessingParameterField, QgsFeatureSink, QgsProcessingParameterFeatureSink)
 from qgis import processing
 from difflib import get_close_matches
-from re import search
 from collections import Counter
 from math import inf
-from datetime import (date, datetime)
+from datetime import (date)
 import networkx as nx
 import time
 
@@ -126,47 +124,435 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
         if input_layer is None or QgsWkbTypes.geometryType(input_layer.wkbType()) != QgsWkbTypes.LineGeometry or input_layer.featureCount() == 0:
             raise QgsProcessingException("Input layer failed to load!")
         
-        state_exists = False
-        if self.parameterAsVectorLayer(parameters, 'STATE_INPUT', context) != None:
-            state_layer = self.parameterAsVectorLayer(parameters, 'STATE_INPUT', context)
-            if state_layer is None or QgsWkbTypes.geometryType(state_layer.wkbType()) != QgsWkbTypes.PolygonGeometry or state_layer.featureCount() == 0:
-                raise QgsProcessingException("State layer failed to load!")
-            state_exists = True
-            
-        county_exists = False
-        if self.parameterAsVectorLayer(parameters, 'COUNTY_INPUT', context) != None:
-            county_layer = self.parameterAsVectorLayer(parameters, 'COUNTY_INPUT', context)
-            if county_layer is None or QgsWkbTypes.geometryType(county_layer.wkbType()) != QgsWkbTypes.PolygonGeometry or county_layer.featureCount() == 0:
-                raise QgsProcessingException("County layer failed to load!")
-            county_exists = True
-        
-        country_exists = False
-        if self.parameterAsVectorLayer(parameters, 'COUNTRY_INPUT', context) != None:
-            country_layer = self.parameterAsVectorLayer(parameters, 'COUNTRY_INPUT', context)
-            if country_layer is None or QgsWkbTypes.geometryType(country_layer.wkbType()) != QgsWkbTypes.PolygonGeometry or country_layer.featureCount() == 0:
-                raise QgsProcessingException("Country layer failed to load!")
-            country_exists = True
-        
-        bypass_split = self.parameterAsBoolean(parameters, 'BYPASS_SPLIT', context)
-        min_geom_length = self.parameterAsDouble(parameters, 'MIN_LENGTH', context)
-        break_length = self.parameterAsDouble(parameters, 'BREAK_LENGTH', context)
-        snapping_tolerance = self.parameterAsDouble(parameters, 'SNAP_TOL', context)
-        disconnected_islands_tolerance = self.parameterAsDouble(parameters, 'ISLAND_TOL', context)
-        
-        state_abbr = self.parameterAsString(parameters, 'STATE_ABBR', context)
-        state_fips = self.parameterAsString(parameters, 'STATE_FIPS', context)
-        county_name = self.parameterAsString(parameters, 'COUNTY_NAME', context)
-        county_fips = self.parameterAsString(parameters, 'COUNTY_FIPS', context)
-        country_abbr = self.parameterAsString(parameters, 'COUNTRY_ABBR', context) #next(iter(self.parameterAsStrings(parameters, 'COUNTRY_ABBR', context)), None)
+        def progressUpdate(percent, changelog = ""):
+            feedback.setProgress(percent)
+            if changelog != "":
+                feedback.setProgressText(changelog)
 
+        def uniqueFieldAdd(layer, name, type):
+            if (name not in [f.name() for f in layer.fields()]):
+                layer.dataProvider().addAttributes([QgsField(name, type)])
+                layer.updateFields()
+        
         project = QgsProject.instance()
+        distanceArea = QgsDistanceArea()
+        project.setDistanceUnits(QgsUnitTypes.DistanceMiles)
+        flagged = []
+        progressUpdate(3)
         if feedback.isCanceled():
             return {} 
         
 
-        # Class DisconnectedIslands modified from disconnected-islands
-        # Copyright (c) 2024 Peter Smythe (https://github.com/AfriGIS-South-Africa/disconnected-islands)
-        # Licensed under MIT
+
+        #
+        # -------------------------- STEP 1 -------------------------
+        #
+
+        startTime = time.time()
+        # 1a) Get latest NCF from web
+        fix_param_1 = {
+            'INPUT': parameters['CHANNELREACH_INPUT'],
+            'METHOD': 1,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        fix_result_1 = processing.run("native:fixgeometries", fix_param_1, is_child_algorithm=True, context=context)
+        fix_layer_1 = context.getMapLayer(fix_result_1['OUTPUT'])
+        t1 = time.time()
+        progressUpdate(6, f'- Retrieved latest NCF framework from web {t1 - startTime}')
+        if feedback.isCanceled():
+            return {}
+
+        fix_param_2 = {
+            'INPUT': parameters['INPUT'],
+            'METHOD': 1,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        fix_result_2 = processing.run("native:fixgeometries", fix_param_2, is_child_algorithm=True, context=context)
+        fix_layer_2 = context.getMapLayer(fix_result_2['OUTPUT'])
+        t1 = time.time()
+        progressUpdate(9, f" {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+        
+        bypass_split = self.parameterAsBoolean(parameters, 'BYPASS_SPLIT', context)
+        min_geom_length = self.parameterAsDouble(parameters, 'MIN_LENGTH', context)
+        break_length = self.parameterAsDouble(parameters, 'BREAK_LENGTH', context)
+        if not bypass_split:
+
+            # 1b) Polygons to Lines
+            polygon_to_line_param = {
+                'INPUT': fix_layer_1,
+                'OUTPUT': 'TEMPORARY_OUTPUT'
+            }
+            polygon_result = processing.run("native:polygonstolines", polygon_to_line_param, is_child_algorithm=True, context=context)
+            polygon_layer = context.getMapLayer(polygon_result['OUTPUT'])
+            project.addMapLayer(polygon_layer, False)
+            t1 = time.time()
+            progressUpdate(12, f'- Converted Polygons to Lines {t1 - startTime}')
+            if feedback.isCanceled():
+                return {} 
+
+            # 1c) Split Lines with Lines
+
+            # Thinking through all cases as a result of splitting NCF with wtwy_lines...
+            # CASE 1: Best case. 0 splits.
+            # CASE 2: 1 split. Both results are big.
+            # CASE 3: 1 split. One result is small. Small rejoins with big.
+            # CASE 4: 1 split. Both are small. Small rejoins with other small to become big.
+            # CASE 5: Multiple splits. All results are big.
+            # CASE 6: Multiple splits. One result is small. Other result(s) are big. 
+            #            Small rejoins with nearest big.
+            # CASE 7: Multiple splits. Multiple results are small. Other result(s) are big. 
+            #            7a - Small rejoins with nearest small to become big, 
+            #            7b - small rejoins with nearest big,
+            #            7c - small rejoins with nearest small as many times necessary to become big,
+            #            7d - small rejoins with conglomeration.
+            # CASE 8: Multiple splits. All results are small. Same as CASE 7c.
+            # CASE 9: Worst case. 1/multiple split(s). Unable to rejoin with enough smalls 
+            #            to become big. Must call in other lines_feat neighbors as many 
+            #            times as necessary to become big. This case does not exist in wtwy_lines
+            #            currently, but it theoretically may happen in the future as NCF changes.
+
+            def unionSplits(geom, feat_to_remove, split_layer, split_feats, new_feats):
+                short_geom_spatial_index = QgsSpatialIndex(split_layer.getFeatures())
+                neighborIDs = short_geom_spatial_index.nearestNeighbor(geom)
+                small = [s.id() for s in split_layer.getFeatures() if distanceArea.convertLengthMeasurement(s.geometry().length(), QgsUnitTypes.DistanceMiles) <= break_length]
+                new_feat_connectors = [(n, n.id()) for n in new_feats if n.geometry().intersects(geom)]
+
+                if feat_to_remove.id() in neighborIDs:
+                    neighborIDs.remove(feat_to_remove.id())
+                if feat_to_remove.id() in small:
+                    small.remove(feat_to_remove.id())
+                    split_layer.startEditing()
+                    split_layer.deleteFeature(feat_to_remove.id())
+                    split_layer.commitChanges()
+                if feat_to_remove.id() in [x[1] for x in new_feat_connectors]:
+                    new_feat_cidx = [x[1] for x in new_feat_connectors].index(feat_to_remove.id())
+                    new_feat_connectors.pop(new_feat_cidx)
+
+                actual_neighborIDs = [nID for nID in neighborIDs if split_layer.getFeature(nID).geometry().intersects(geom)]
+
+                if actual_neighborIDs:
+                    n = split_layer.getFeature(actual_neighborIDs[0]).geometry()
+                    geom = geom.combine(n)
+                    split_layer.startEditing()
+                    split_layer.deleteFeature(actual_neighborIDs[0])
+                    split_layer.deleteFeature(feat_to_remove.id())
+                    split_layer.commitChanges()
+                    if split_feats[actual_neighborIDs[0]] in new_feats:
+                        new_feats.remove(split_feats[actual_neighborIDs[0]])
+                    return (geom, actual_neighborIDs[0], False)
+                elif not small or new_feat_connectors:
+                    neighbor = QgsFeature(fix_layer_2.fields())
+                    if new_feat_connectors:
+                        neighbor = new_feat_connectors[-1][0]
+                    geom = geom.combine(neighbor.geometry())
+                    split_layer.startEditing()
+                    split_layer.deleteFeature(neighbor.id())
+                    split_layer.commitChanges()
+                    if neighbor.attributeCount() == 0:
+                        return (geom, neighbor.id(), True)
+                    else:
+                        return (geom, "break", False)
+                else:
+                    return (geom, "break", False)
+
+            fix_layer_2.startEditing()
+            to_delete = dict()
+            for lines_feat in fix_layer_2.getFeatures():
+                new_feats = set()
+                fix_layer_2.select(lines_feat.id())
+
+                difference_params = {
+                    'INPUT': QgsProcessingFeatureSourceDefinition(fix_layer_2.id(), selectedFeaturesOnly = True, featureLimit = -1, geometryCheck = QgsFeatureRequest.GeometryAbortOnInvalid),
+                    'OVERLAY': polygon_layer,
+                    'OUTPUT': 'TEMPORARY_OUTPUT',
+                    'GRID_SIZE': None
+                }
+                diff_result = processing.run("native:difference", difference_params, is_child_algorithm=True, context=context)
+                diff_layer = context.getMapLayer(diff_result['OUTPUT'])
+                
+                duplicate_vert_params = {
+                    'INPUT': diff_layer,
+                    'TOLERANCE': 1e-06,
+                    'USE_Z_VALUE': False,
+                    'OUTPUT': 'TEMPORARY_OUTPUT'
+                }
+                duplicate_vert_result = processing.run("native:removeduplicatevertices", duplicate_vert_params, is_child_algorithm=True, context=context)
+                duplicate_vert_layer = context.getMapLayer(duplicate_vert_result['OUTPUT'])
+
+                temp_fix_param = {
+                    'INPUT': duplicate_vert_layer,
+                    'METHOD': 1,
+                    'OUTPUT': 'TEMPORARY_OUTPUT'
+                }
+                temp_fix_result = processing.run("native:fixgeometries", temp_fix_param, is_child_algorithm=True, context=context)
+                temp_fix_layer = context.getMapLayer(temp_fix_result['OUTPUT'])
+                
+                split_params = {
+                    'INPUT': temp_fix_layer,
+                    'LINES': polygon_layer,
+                    'OUTPUT': 'TEMPORARY_OUTPUT'
+                }
+                split_result = processing.run("native:splitwithlines", split_params, is_child_algorithm=True, context=context)
+                split_layer = context.getMapLayer(split_result['OUTPUT'])
+                fix_layer_2.removeSelection()
+
+                split_IDs = [s.id() for s in split_layer.getFeatures()]
+
+                # CASE 1
+                if len(split_IDs) < 2:
+                    continue
+
+                split_feats = { id : split_layer.getFeature(id) for id in split_IDs }
+                split_lengths = { id : distanceArea.convertLengthMeasurement(split_layer.getFeature(id).geometry().length(), QgsUnitTypes.DistanceMiles) for id in split_IDs }
+
+                split_big_IDs = []
+                split_small_IDs = []
+                for key in split_lengths:
+                    if split_lengths[key] > break_length:
+                        split_big_IDs.append(key)
+                    else:
+                        split_small_IDs.append(key)
+
+                # CASES 2, 5
+                if not split_small_IDs:
+                    for key in split_big_IDs:
+                        new_feats.add(split_feats[key])
+
+                # CASE 4
+                elif len(split_IDs) == 2:
+                    new_feat = QgsFeature(fix_layer_2.fields())
+                    new_feat.setAttributes(lines_feat.attributes())
+                    g, _, _ = unionSplits(next(iter(split_feats.values())).geometry(), next(iter(split_feats.values())), split_layer, split_feats, new_feats)
+                    new_feat.setGeometry(g)
+                    new_feats.add(new_feat)
+
+                # CASES 3, 6, 7, 8
+                else:
+                    copy_small_IDs = split_small_IDs
+                    for key in split_big_IDs:
+                        new_feats.add(split_feats[key])
+                    for key in split_small_IDs:
+                        if key in copy_small_IDs:
+                            new_feat = QgsFeature(fix_layer_2.fields())
+                            new_feat.setAttributes(lines_feat.attributes())
+                            s = split_feats[key]
+                            g = s.geometry()
+                            continue_looping = True
+                            while continue_looping and distanceArea.convertLengthMeasurement(g.length(), QgsUnitTypes.DistanceMiles) <= break_length: 
+
+                                split_layer.startEditing()
+                                # Create spatial index each iteration. Costly, but necessary.
+                                sp_idx = QgsSpatialIndex()
+                                map(sp_idx.insertFeature, split_layer.getFeatures())
+                                neighborIDs = sp_idx.nearestNeighbor(g)
+                                if key in neighborIDs:
+                                    neighborIDs.remove(key)
+                                
+                                if neighborIDs:
+                                    n = QgsFeature()
+                                    found_big = False
+                                    # Target big neighbor.
+                                    for nID in neighborIDs:
+                                        if nID in split_big_IDs:
+                                            n = split_layer.getFeature(nID)
+                                            found_big = True
+                                            break
+                                    # If no big neighbors nearby, target small neighbor.
+                                    if not found_big:
+                                        for nID in neighborIDs:
+                                            if nID in copy_small_IDs:
+                                                n = split_layer.getFeature(nID)
+                                                break
+                                    # Extend geometry with chosen neighbor.
+                                    g = g.combine(n.geometry())
+                                    # Delete chosen neighbor. From split_layer & split_feats & split_small_IDs/split_big_IDs.
+                                    split_layer.deleteFeature(n.id())
+                                    if n.id() in split_feats:
+                                        del split_feats[n.id()]
+                                    if n.id() in copy_small_IDs:
+                                        copy_small_IDs.remove(n.id())
+                                    if n.id() in split_big_IDs:
+                                        split_big_IDs.remove(n.id())
+
+                                elif any(g.touches(f.geometry()) for f in new_feats): 
+                                    connectors = [f for f in new_feats if g.touches(f.geometry())]
+                                    g = g.combine(connectors[0].geometry())
+                                    new_feats.remove(connectors[0])
+                                
+                                else:
+                                    continue_looping = False
+                                
+                                split_layer.commitChanges()
+                                if feedback.isCanceled():
+                                    return {}
+
+                            new_feat.setGeometry(g)
+                            new_feats.add(new_feat)
+                            
+                    if feedback.isCanceled():
+                        return {}
+
+                total_length = 0
+                for f in new_feats:
+                    total_length += distanceArea.convertLengthMeasurement(f.geometry().length(), QgsUnitTypes.DistanceMiles)
+                if total_length > break_length:
+                    to_delete[lines_feat.id()] = list(new_feats)
+                
+                progressUpdate(15)
+                if feedback.isCanceled():
+                    return {}
+                
+            for key in to_delete:
+                fix_layer_2.addFeatures(to_delete[key])
+                fix_layer_2.deleteFeature(key)
+            fix_layer_2.commitChanges()
+        
+        lines_layer = fix_layer_2.materialize(QgsFeatureRequest())
+        del input_layer
+        del break_length
+        if not bypass_split:
+            del to_delete
+            del polygon_to_line_param
+            del polygon_result
+            del polygon_layer
+            del difference_params
+            del diff_result
+            del diff_layer
+            del duplicate_vert_params
+            del duplicate_vert_result
+            del duplicate_vert_layer
+            del temp_fix_param
+            del temp_fix_result
+            del temp_fix_layer
+            del split_params
+            del split_result
+            del split_layer
+            del split_IDs
+            del split_feats
+            del split_lengths
+            del split_big_IDs
+            del split_small_IDs
+            del copy_small_IDs
+            del new_feat
+            del new_feats
+        del bypass_split
+        t1 = time.time()
+        progressUpdate(18, f"Split Waterway Lines Based On ChannelReach {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+
+
+
+        #
+        # -------------------------- STEP 2 -------------------------
+        #
+
+        
+        
+        # 2b) Open attributes table, abacus icon, update existing attribute, LenMiles, Geometry, re-calculate $length
+        lines_layer.startEditing()
+        for feature in lines_layer.getFeatures():
+            feature["LenMiles"] = round(distanceArea.convertLengthMeasurement(feature.geometry().length(), QgsUnitTypes.DistanceMiles), 4)
+            lines_layer.updateFeature(feature)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(24, f"Recalculated length {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+        # 2c) Correct linkType typos. Acceptable: (see list); flag Nulls - save flagged entries to a file and print to cmd.
+        linkTypes = ["CPT", "Centerline", "Coastal-connect", "Inland", "Great Lakes/St", "International", "Internat River"]
+        linkType_str = "'" + "', '".join(linkTypes) + "'"
+        expr = f"(LinkType not in ({ linkType_str }) or LinkType is NULL) AND NOT Name ILIKE '%Manual Connection%'"
+        linkType = ''
+        matches = []
+        lines_layer.startEditing()
+        for feature in lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr)):
+            linkType = str(feature["LinkType"])
+            if feature["LinkType"] == None:
+                flagged.append((feature["Name"], "Null LinkType"))
+            elif 'lock' not in linkType.lower():
+                matches = get_close_matches(linkType, linkTypes, n=1, cutoff=0.5)
+                if matches:
+                    feature["LinkType"] = matches[0]
+                    lines_layer.updateFeature(feature)
+                else:
+                    flagged.append((feature["Name"], "Invalid LinkType"))
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(27, f"Checked for LinkType typos {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+        # 2d) Toolbox: "Create spatial index"
+        processing.run("native:createspatialindex", {'INPUT': lines_layer})
+
+        del linkTypes
+        del linkType_str
+        del expr
+        del linkType
+        del matches
+        t1 = time.time()
+        progressUpdate(28, f"Created spatial index {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+
+
+
+        #
+        # -------------------------- STEP 3 -------------------------
+        #
+
+        # 3b) Remove empty and very short geometries (length <= 0.02mi)
+        lines_layer.startEditing()
+        for feature in lines_layer.getFeatures():
+            if (feature.geometry().isNull() or feature.geometry().isEmpty() or not feature.hasGeometry() or distanceArea.convertLengthMeasurement(feature.geometry().length(), QgsUnitTypes.DistanceMiles) <= min_geom_length) and not str(feature["Name"]).startswith('Manual Connection'):
+                lines_layer.deleteFeature(feature.id())
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(30, f"Removed empty & very short geometries {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+        # 3c) Toolbox: Snap Geometries (End points only, tolerance = 0.0002 degrees)
+        snapping_tolerance = self.parameterAsDouble(parameters, 'SNAP_TOL', context)
+        null_geom_params = {
+            'INPUT': lines_layer,
+            'REMOVE_EMPTY': False,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        null_geom_result = processing.run("native:removenullgeometries", null_geom_params, is_child_algorithm=True, context=context)
+        null_geom_layer = context.getMapLayer(null_geom_result['OUTPUT'])
+        fix_param_4 = {
+            'INPUT': null_geom_layer,
+            'METHOD': 0,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        fix_result_4 = processing.run("native:fixgeometries", fix_param_4, is_child_algorithm=True, context=context)
+        fix_layer_4 = context.getMapLayer(fix_result_4['OUTPUT'])
+        snap_geometries_params = {
+            'INPUT': fix_layer_4,
+            'REFERENCE_LAYER': fix_layer_4,
+            'TOLERANCE': snapping_tolerance,
+            'BEHAVIOR': 6,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        snap_geometries_result = processing.run("native:snapgeometries", snap_geometries_params, is_child_algorithm=True, context=context)
+        snap_geometries_layer = context.getMapLayer(snap_geometries_result['OUTPUT'])
+        multi_to_single_params = {
+            'INPUT': snap_geometries_layer,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        multi_to_single_results = processing.run("native:multiparttosingleparts", multi_to_single_params, is_child_algorithm=True, context=context)
+        multi_to_single_layer = context.getMapLayer(multi_to_single_results['OUTPUT'])
+        t1 = time.time()
+        progressUpdate(33, f"Snapped geometries {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+
+        # 3d) Run Disconnected Islands
         class DisconnectedIslands(object):
             def __init__(self, l):
                 self.layer = l
@@ -207,11 +593,242 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                 self.layer.commitChanges()
                 return (self.layer, [i for i in set(fid_comp.values()) if i > 0])
 
-        # Class Networks modified from networks
-        # Copyright (c) [2025] crocovert (https://github.com/crocovert)
-        # Licensed under GPL-3.0
-        class Networks(QgsProcessingAlgorithm):
+        disconnected_islands_tolerance = self.parameterAsDouble(parameters, 'ISLAND_TOL', context)
+        disconnectedIslandsPlugin = DisconnectedIslands(multi_to_single_layer)
+        islands = []
+        (disconnected_layer, islands) = disconnectedIslandsPlugin.run(disconnected_islands_tolerance)
 
+        tolerance = snapping_tolerance
+        disconnected_detected = False
+        while islands:
+            disconnected_detected = True
+            mainland_layer = disconnected_layer.materialize(QgsFeatureRequest().setFilterExpression("networkGrp = 0"))
+            mainland_spIdx = QgsSpatialIndex(mainland_layer.getFeatures(), flags=QgsSpatialIndex.FlagStoreFeatureGeometries)
+            disconnected_layer.startEditing()
+            for island in islands:
+                min_dist = inf
+                expr = "networkGrp = " + str(island)
+                island_layer = disconnected_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr))
+                for island_feat in island_layer:
+                    main_neighbor = mainland_spIdx.nearestNeighbor(island_feat.geometry(), 1, tolerance)
+                    if main_neighbor:
+                        mainland_feat = mainland_layer.getFeature(main_neighbor[0])
+                        for p1 in [QgsPointXY(v) for v in island_feat.geometry().vertices()]:
+                            for p2 in [QgsPointXY(v) for v in mainland_feat.geometry().vertices()]:
+                                if QgsDistanceArea().measureLine(p1, p2) < min_dist:
+                                    min_dist = QgsDistanceArea().measureLine(p1, p2)
+                                    closest_island_feat = island_feat
+                                    closest_islandP = p1
+                                    closest_mainP = p2
+                if min_dist != inf:
+                    closest_island_feat.setGeometry(closest_island_feat.geometry().combine(QgsGeometry().fromPolylineXY([closest_islandP, closest_mainP])))
+                    disconnected_layer.updateFeature(closest_island_feat)
+            disconnected_layer.commitChanges()
+
+            multi_to_single_params = {
+                'INPUT': disconnected_layer,
+                'OUTPUT': 'TEMPORARY_OUTPUT'
+            }
+            multi_to_single_results = processing.run("native:multiparttosingleparts", multi_to_single_params, is_child_algorithm=True, context=context)
+            multi_to_single_layer = context.getMapLayer(multi_to_single_results['OUTPUT'])
+            
+            disconnectedIslandsPlugin = DisconnectedIslands(multi_to_single_layer)
+            islands = []
+            (disconnected_layer, islands) = disconnectedIslandsPlugin.run(disconnected_islands_tolerance)
+            tolerance += snapping_tolerance
+            if feedback.isCanceled():
+                return {}
+        
+        del snapping_tolerance
+        del fix_param_2
+        del fix_result_2
+        del fix_layer_2
+        del null_geom_params
+        del null_geom_result
+        del null_geom_layer
+        del fix_param_4
+        del fix_result_4
+        del fix_layer_4
+        del snap_geometries_params
+        del snap_geometries_result
+        del snap_geometries_layer
+        del multi_to_single_params
+        del multi_to_single_results
+        del multi_to_single_layer
+        del DisconnectedIslands
+        del disconnectedIslandsPlugin
+        del islands
+        del tolerance
+        if disconnected_detected:
+            del mainland_layer
+            del mainland_spIdx
+            del expr
+            del island_layer
+            del main_neighbor
+            del mainland_feat
+            del min_dist
+            del closest_island_feat
+            del closest_islandP
+            del closest_mainP
+        del disconnected_detected
+        t1 = time.time()
+        progressUpdate(36, f"Reconnected disconnected islands {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+
+
+        #
+        # -------------------------- STEP 4 -------------------------
+        #
+        
+
+
+        # 4a) Join Channel_layer by location, 1-1 join type, maximum overlap
+        fix_param_3 = {
+            'INPUT': disconnected_layer,
+            'METHOD': 1,
+            'OUTPUT': 'TEMPORARY_OUTPUT'
+        }
+        fix_result_3 = processing.run("native:fixgeometries", fix_param_3, is_child_algorithm=True, context=context)
+        fix_layer_3 = context.getMapLayer(fix_result_3['OUTPUT'])
+        t1 = time.time()
+        progressUpdate(42, f" {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+        uniqueFieldAdd(fix_layer_3, "ChannelRea", QVariant.String)
+        fix_layer_3.startEditing()
+        for ncf_feat in fix_layer_1.getFeatures():
+            for lines_feat in fix_layer_3.getFeatures(QgsFeatureRequest().setFilterRect(ncf_feat.geometry().boundingBox())):
+                biggest_overlapping_feat = QgsFeature()
+                biggest_overlap = 0.0
+                for ncf_overlap in fix_layer_1.getFeatures(QgsFeatureRequest().setFilterRect(lines_feat.geometry().boundingBox())):
+                    if distanceArea.convertLengthMeasurement(ncf_overlap.geometry().intersection(lines_feat.geometry()).length(), QgsUnitTypes.DistanceMiles) > biggest_overlap:
+                        biggest_overlap = distanceArea.convertLengthMeasurement(ncf_overlap.geometry().intersection(lines_feat.geometry()).length(), QgsUnitTypes.DistanceMiles)
+                        biggest_overlapping_feat = ncf_overlap
+                if biggest_overlap != 0.0:
+                    lines_feat.setAttribute("ChannelRea", biggest_overlapping_feat["channelreachidpk"])
+                    # 5a) For links with NCF data, depth = NCF depthmaintained
+                    lines_feat.setAttribute("DepthFt", (biggest_overlapping_feat["depthmaintained"] or 99))
+                    fix_layer_3.updateFeature(lines_feat)
+            if feedback.isCanceled():
+                return {} 
+        fix_layer_3.commitChanges()
+
+        lines_layer = fix_layer_3.materialize(QgsFeatureRequest())
+        del fix_param_1
+        del fix_result_1
+        del fix_layer_1
+        del fix_param_3
+        del fix_result_3
+        del fix_layer_3
+        del biggest_overlapping_feat
+        del biggest_overlap
+        t1 = time.time()
+        progressUpdate(45, f"Joined eHydro attributes by location {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+
+
+
+        #
+        # -------------------------- STEP 5 -------------------------
+        #
+        
+        # 5b) For all international links, depth = 99
+        lines_layer.startEditing()
+        for feat in lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression("LinkType = 'International' or LinkType = 'Internat River'")):
+            feat["DepthFt"] = 99
+            lines_layer.updateFeature(feat)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(57, f"DepthFt attributes assigned {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+        # 3a) Check for null/duplicate/nonsense LinkIDs & names
+        linkID_max = lines_layer.featureCount() * 2
+        linkIDs_to_use = list((set(range(1, linkID_max)) - set(QgsVectorLayerUtils.getValues(lines_layer, "LinkId")[0])))
+        lines_layer.startEditing()
+        for feat in lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression("LinkId IS NULL")):
+            feat["LinkId"] = linkIDs_to_use.pop(0)
+            lines_layer.updateFeature(feat)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(58, f" {t1 - startTime}")
+
+        lines_layer.startEditing()
+        expr = f"LinkId > {linkID_max} or LinkId < 1"
+        for feat in lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr)):
+            feat["LinkId"] = linkIDs_to_use.pop(0)
+            lines_layer.updateFeature(feat)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(59, f" {t1 - startTime}")
+
+        duplicateIDs = [item for item, count in Counter(QgsVectorLayerUtils.getValues(lines_layer, "LinkId")[0]).items() if count > 1]
+        lines_layer.startEditing()
+        for id in duplicateIDs:
+            expr1 = f"LinkId = {id}"
+            for feat in list(lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr1)))[1:]:
+                feat["LinkId"] = linkIDs_to_use.pop(0)
+                lines_layer.updateFeature(feat)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(60, f"Checked for duplicate LinkIDs {t1 - startTime}")
+        
+        lines_layer.startEditing()
+        for idx, feat in enumerate(lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression("Name IS NULL"))):
+            feat["Name"] = str(idx)
+            lines_layer.updateFeature(feat)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(63, f" {t1 - startTime}")
+
+        duplicateNames = [item for item, count in Counter(QgsVectorLayerUtils.getValues(lines_layer, "Name")[0]).items() if count > 1]
+        lines_layer.startEditing()
+        for name in duplicateNames:
+            expr = f"Name = '{name}'"
+            for idx, feat in enumerate(lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr))):
+                if idx != 0:
+                    feat["Name"] = name + ' ' + str(idx + 1)
+                    lines_layer.updateFeature(feat)
+        lines_layer.commitChanges()
+        t1 = time.time()
+        progressUpdate(66, f"Checked for duplicate names {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+
+        # Remove Plot, Domestic, Deepdraft attributes
+        if lines_layer.fields().indexFromName('Plot') != -1:
+            lines_layer.dataProvider().deleteAttributes([lines_layer.fields().indexFromName('Plot')])
+            lines_layer.updateFields()
+        if lines_layer.fields().indexFromName('Domestic') != -1:
+            lines_layer.dataProvider().deleteAttributes([lines_layer.fields().indexFromName('Domestic')])
+            lines_layer.updateFields()
+        if lines_layer.fields().indexFromName('Deepdraft') != -1:
+            lines_layer.dataProvider().deleteAttributes([lines_layer.fields().indexFromName('Deepdraft')])
+            lines_layer.updateFields()
+
+        del linkID_max
+        del expr
+        del linkIDs_to_use
+        del duplicateIDs
+        del duplicateNames
+        t1 = time.time()
+        progressUpdate(78, f"Removed Plot, Domestic, Deepdraft attributes {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+
+
+        #
+        # -------------------------- STEP 6 -------------------------
+        #
+        
+        # 6a) Use QGIS Networks plugin (Build Graph)
+        class Networks(QgsProcessingAlgorithm):
             def build_graph(self, parameters):       
                 reseau = parameters["RESEAU"]
                 sens = parameters["SENS"]
@@ -237,8 +854,9 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                 noeuds = {}
                 src = QgsCoordinateReferenceSystem(layer.crs())
                 dest = QgsCoordinateReferenceSystem("EPSG:4326")
-                xtr = QgsCoordinateTransform(src, dest, project)
+                xtr = QgsCoordinateTransform(src, dest, QgsProject.instance())
 
+                layer.startEditing()
                 for ligne in layer.getFeatures():
                     if len(sens) == 0:
                         test_sens = '1'
@@ -249,6 +867,9 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                             test_sens = '0'
                     
                     gligne = ligne.geometry()
+                    if gligne.isEmpty():
+                        layer.deleteFeature(ligne.id())
+                        continue
                     if test_sens == '1':
                         if gligne.wkbType() in [QgsWkbTypes.MultiLineString, QgsWkbTypes.MultiLineStringZ]:
                             g = gligne.asMultiPolyline()
@@ -279,6 +900,7 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                             noeuds[nb] = (prefixe + libb, 1)
                         else:
                             noeuds[nb] = (prefixe + libb, noeuds[nb][1] + 1)
+                layer.commitChanges()
 
                 node_layer = QgsVectorLayer("Point", "temporary_points", "memory")
                 node_provider = node_layer.dataProvider()
@@ -330,617 +952,7 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                             layer.changeAttributeValues(id, valid)
                 layer.commitChanges()
                 return (layer, node_layer)
-        
-        def progressUpdate(percent, changelog = ""):
-            feedback.setProgress(percent)
-            if changelog != "":
-                feedback.setProgressText(changelog)
-        
-        def CreateSpatialIndex(layer):
-            spatialIndex = QgsSpatialIndex(layer.getFeatures())
-            indexedFeatureIDs = spatialIndex.intersects(QgsRectangle(QgsPointXY(-inf, -inf), QgsPointXY(inf, inf)))
-            temp_layer = QgsVectorLayer("MultiLineString?crs={}&index=yes".format(lines_layer.crs().authid()), "centroids", "memory")
-            provider = temp_layer.dataProvider()
-            provider.addAttributes(layer.fields())
-            temp_layer.updateFields()
-            temp_layer.startEditing()
-            for id in indexedFeatureIDs:
-                provider.addFeature(layer.getFeature(id))
-            temp_layer.commitChanges()
-            return temp_layer
 
-        def makePointList(geom, list_of_points):
-            if QgsWkbTypes.isSingleType(geom.wkbType()):
-                    for pnt in geom.asPolyline():
-                        if (pnt.y(), pnt.x()) not in list_of_points:
-                            list_of_points.append((pnt.y(), pnt.x()))
-            else:
-                for part in geom.asMultiPolyline():
-                    for pnt in part:
-                        if (pnt.y(), pnt.x()) not in list_of_points:
-                            list_of_points.append((pnt.y(), pnt.x()))
-
-        def unionSplits(geom, feat_to_remove, split_layer, split_feats, new_feats):
-            short_geom_spatial_index = QgsSpatialIndex(split_layer.getFeatures())
-            neighborIDs = short_geom_spatial_index.nearestNeighbor(geom)
-            small = [s.id() for s in split_layer.getFeatures() if distanceArea.convertLengthMeasurement(s.geometry().length(), QgsUnitTypes.DistanceMiles) <= break_length]
-            new_feat_connectors = [(n, n.id()) for n in new_feats if n.geometry().intersects(geom)]
-
-            if feat_to_remove.id() in neighborIDs:
-                neighborIDs.remove(feat_to_remove.id())
-            if feat_to_remove.id() in small:
-                small.remove(feat_to_remove.id())
-                split_layer.startEditing()
-                split_layer.deleteFeature(feat_to_remove.id())
-                split_layer.commitChanges()
-            if feat_to_remove.id() in [x[1] for x in new_feat_connectors]:
-                new_feat_cidx = [x[1] for x in new_feat_connectors].index(feat_to_remove.id())
-                new_feat_connectors.pop(new_feat_cidx)
-
-            actual_neighborIDs = [nID for nID in neighborIDs if split_layer.getFeature(nID).geometry().intersects(geom)]
-
-            if actual_neighborIDs:
-                n = split_layer.getFeature(actual_neighborIDs[0]).geometry()
-                geom = geom.combine(n)
-                split_layer.startEditing()
-                split_layer.deleteFeature(actual_neighborIDs[0])
-                split_layer.deleteFeature(feat_to_remove.id())
-                split_layer.commitChanges()
-                if split_feats[actual_neighborIDs[0]] in new_feats:
-                    new_feats.remove(split_feats[actual_neighborIDs[0]])
-                return (geom, actual_neighborIDs[0], False)
-            elif not small or new_feat_connectors:
-                neighbor = QgsFeature(fix_layer_2.fields())
-                if new_feat_connectors:
-                    neighbor = new_feat_connectors[-1][0]
-                geom = geom.combine(neighbor.geometry())
-                split_layer.startEditing()
-                split_layer.deleteFeature(neighbor.id())
-                split_layer.commitChanges()
-                if neighbor.attributeCount() == 0:
-                    return (geom, neighbor.id(), True)
-                else:
-                    return (geom, "break", False)
-            else:
-                return (geom, "break", False)
-
-        def manualExtend(feat, neighbor_name):
-            points = []
-            neighbor_points = []
-            makePointList(feat.geometry(), points)
-            neighbor = [n for n in fix_layer_2.getFeatures() if n["Name"] == neighbor_name]
-            if neighbor:
-                makePointList(neighbor[0].geometry(), neighbor_points)
-                closest_p = QgsPointXY()
-                closest_np = QgsPointXY()
-                min_dist = inf
-                for pnt1 in points:
-                    for pnt2 in neighbor_points:
-                        if distanceArea.measureLine(QgsPointXY(pnt1[0], pnt1[1]), QgsPointXY(pnt2[0], pnt2[1])) < min_dist:
-                            min_dist = distanceArea.measureLine(QgsPointXY(pnt1[0], pnt1[1]), QgsPointXY(pnt2[0], pnt2[1]))
-                            closest_p = QgsPointXY(pnt1[1], pnt1[0])
-                            closest_np = QgsPointXY(pnt2[1], pnt2[0])
-                new_feat = QgsFeature(fix_layer_2.fields())
-                new_feat.setAttributes([9999999, 'Manual Connection', 0.0, 0, 'Centerline', 0, 'Inland', NULL, NULL, NULL, NULL])
-                geom = QgsGeometry().fromPolylineXY([closest_p, closest_np])
-                new_feat.setGeometry(geom)
-                if not closest_np.isEmpty() and not closest_p.isEmpty() and geom not in [f.geometry() for f in fix_layer_2.getFeatures(QgsFeatureRequest().setFilterExpression("Name like 'Manual Connection%'"))]:
-                    fix_layer_2.startEditing()
-                    fix_layer_2.dataProvider().addFeatures([new_feat])
-                    fix_layer_2.commitChanges()
-
-        def uniqueFieldAdd(layer, name, type):
-            if (name not in [f.name() for f in layer.fields()]):
-                layer.dataProvider().addAttributes([QgsField(name, type)])
-                layer.updateFields()
-        progressUpdate(3)
-
-        #
-        # -------------------------- STEP 1 -------------------------
-        #
-
-
-
-        startTime = time.time()
-        # 1a) Get latest NCF from web
-        fix_param_1 = {
-            'INPUT': parameters['CHANNELREACH_INPUT'],
-            'METHOD': 1,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        fix_result_1 = processing.run("native:fixgeometries", fix_param_1, is_child_algorithm=True, context=context)
-        fix_layer_1 = context.getMapLayer(fix_result_1['OUTPUT'])
-        t1 = time.time()
-        progressUpdate(6, f'- Retrieved latest NCF framework from web {t1 - startTime}')
-        if feedback.isCanceled():
-            return {}
-
-        fix_param_2 = {
-            'INPUT': parameters['INPUT'],
-            'METHOD': 1,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        fix_result_2 = processing.run("native:fixgeometries", fix_param_2, is_child_algorithm=True, context=context)
-        fix_layer_2 = context.getMapLayer(fix_result_2['OUTPUT'])
-        t1 = time.time()
-        progressUpdate(9, f" {t1 - startTime}")
-        if feedback.isCanceled():
-            return {}
-        
-        distanceArea = QgsDistanceArea()
-        project.setDistanceUnits(QgsUnitTypes.DistanceMiles)
-        flagged = []
-        if not bypass_split:
-
-            # 1b) Polygons to Lines
-            polygon_to_line_param = {
-                'INPUT': fix_layer_1,
-                'OUTPUT': 'TEMPORARY_OUTPUT'
-            }
-            polygon_result = processing.run("native:polygonstolines", polygon_to_line_param, is_child_algorithm=True, context=context)
-            polygon_layer = context.getMapLayer(polygon_result['OUTPUT'])
-            project.addMapLayer(polygon_layer, False)
-            t1 = time.time()
-            progressUpdate(12, f'- Converted Polygons to Lines {t1 - startTime}')
-            if feedback.isCanceled():
-                return {} 
-
-            # 1c) Split Lines with Lines
-
-            # Thinking through all cases as a result of splitting NCF with wtwy_lines...
-            # CASE 1: Best case. 0 splits.
-            # CASE 2: 1 split. Both results are big.
-            # CASE 3: 1 split. One result is small. Small rejoins with big.
-            # CASE 4: 1 split. Both are small. Small rejoins with other small to become big.
-            # CASE 5: Multiple splits. All results are big.
-            # CASE 6: Multiple splits. One result is small. Other result(s) are big. 
-            #            Small rejoins with nearest big.
-            # CASE 7: Multiple splits. Multiple results are small. Other result(s) are big. 
-            #            7a - Small rejoins with nearest small to become big, 
-            #            7b - small rejoins with nearest big,
-            #            7c - small rejoins with nearest small as many times necessary to become big,
-            #            7d - small rejoins with conglomeration.
-            # CASE 8: Multiple splits. All results are small. Same as CASE 7c.
-            # CASE 9: Worst case. 1/multiple split(s). Unable to rejoin with enough smalls 
-            #            to become big. Must call in other lines_feat neighbors as many 
-            #            times as necessary to become big. This case does not exist in wtwy_lines
-            #            currently, but it theoretically may happen in the future as NCF changes.
-
-
-            fix_layer_2.startEditing()
-            to_delete = dict()
-            for lines_feat in fix_layer_2.getFeatures():
-                new_feats = set()
-                fix_layer_2.select(lines_feat.id())
-
-                difference_params = {
-                    'INPUT': QgsProcessingFeatureSourceDefinition(fix_layer_2.id(), selectedFeaturesOnly = True, featureLimit = -1, geometryCheck = QgsFeatureRequest.GeometryAbortOnInvalid),
-                    'OVERLAY': polygon_layer,
-                    'OUTPUT': 'TEMPORARY_OUTPUT',
-                    'GRID_SIZE': None
-                }
-                diff_result = processing.run("native:difference", difference_params, is_child_algorithm=True, context=context)
-                diff_layer = context.getMapLayer(diff_result['OUTPUT'])
-                
-                split_params = {
-                    'INPUT': diff_layer,
-                    'LINES': polygon_layer,
-                    'OUTPUT': 'TEMPORARY_OUTPUT'
-                }
-                split_result = processing.run("native:splitwithlines", split_params, is_child_algorithm=True, context=context)
-                split_layer = context.getMapLayer(split_result['OUTPUT'])
-                fix_layer_2.removeSelection()
-
-                split_IDs = [s.id() for s in split_layer.getFeatures()]
-
-                # CASE 1
-                if len(split_IDs) < 2:
-                    continue
-
-                split_feats = { id : split_layer.getFeature(id) for id in split_IDs }
-                split_lengths = { id : distanceArea.convertLengthMeasurement(split_layer.getFeature(id).geometry().length(), QgsUnitTypes.DistanceMiles) for id in split_IDs }
-
-                split_big_IDs = []
-                split_small_IDs = []
-                for key in split_lengths:
-                    if split_lengths[key] > break_length:
-                        split_big_IDs.append(key)
-                    else:
-                        split_small_IDs.append(key)
-
-                # CASES 2, 5
-                if not split_small_IDs:
-                    for key in split_big_IDs:
-                        new_feats.add(split_feats[key])
-
-                # CASE 4
-                elif len(split_IDs) == 2:
-                    new_feat = QgsFeature(fix_layer_2.fields())
-                    new_feat.setAttributes(lines_feat.attributes())
-                    g, _, _ = unionSplits(next(iter(split_feats.values())).geometry(), next(iter(split_feats.values())), split_layer, split_feats, new_feats)
-                    new_feat.setGeometry(g)
-                    new_feats.add(new_feat)
-
-                # CASES 3, 6, 7, 8
-                else:
-                    copy_small_IDs = split_small_IDs
-                    for key in split_small_IDs:
-                        if key in copy_small_IDs:
-                            new_feat = QgsFeature(fix_layer_2.fields())
-                            new_feat.setAttributes(lines_feat.attributes())
-                            s = split_feats[key]
-                            g = s.geometry()
-                            continue_looping = True
-                            while continue_looping and distanceArea.convertLengthMeasurement(g.length(), QgsUnitTypes.DistanceMiles) <= break_length: 
-
-                                # Create spatial index each iteration. Costly, but necessary.
-                                sp_idx = QgsSpatialIndex(split_layer.getFeatures())
-                                neighborIDs = sp_idx.nearestNeighbor(g)
-                                if key in neighborIDs:
-                                    neighborIDs.remove(key)
-                                
-                                if neighborIDs:
-                                    n = QgsFeature()
-                                    found_big = False
-                                    # Target big neighbor.
-                                    for nID in neighborIDs:
-                                        if nID in split_big_IDs:
-                                            n = split_layer.getFeature(nID)
-                                            found_big = True
-                                            break
-                                    # If no big neighbors nearby, target small neighbor.
-                                    if not found_big:
-                                        for nID in neighborIDs:
-                                            if nID in copy_small_IDs:
-                                                n = split_layer.getFeature(nID)
-                                                break
-                                    # Extend geometry with chosen neighbor.
-                                    g = g.combine(n.geometry())
-                                    # Delete chosen neighbor. From split_layer & split_feats & split_small_IDs/split_big_IDs.
-                                    split_layer.startEditing()
-                                    split_layer.deleteFeature(n.id())
-                                    split_layer.commitChanges()
-                                    if n.id() in split_feats:
-                                        del split_feats[n.id()]
-                                    if n.id() in copy_small_IDs:
-                                        copy_small_IDs.remove(n.id())
-                                    if n.id() in split_big_IDs:
-                                        split_big_IDs.remove(n.id())
-
-                                elif any(g.touches(f.geometry()) for f in new_feats): 
-                                    connectors = [f for f in new_feats if g.touches(f.geometry())]
-                                    g = g.combine(connectors[0].geometry())
-                                    new_feats.remove(connectors[0])
-                                
-                                else:
-                                    continue_looping = False
-                                    
-                                if feedback.isCanceled():
-                                    return {}
-
-                            new_feat.setGeometry(g)
-                            new_feats.add(new_feat)
-
-                    for key in split_big_IDs:
-                        new_feats.add(split_feats[key])
-                    if feedback.isCanceled():
-                        return {}
-
-                total_length = 0
-                for f in new_feats:
-                    total_length += distanceArea.convertLengthMeasurement(f.geometry().length(), QgsUnitTypes.DistanceMiles)
-                if total_length > break_length:
-                    to_delete[lines_feat.id()] = list(new_feats)
-                
-                progressUpdate(15)
-                if feedback.isCanceled():
-                    return {}
-                
-            for key in to_delete:
-                fix_layer_2.addFeatures(to_delete[key])
-                fix_layer_2.deleteFeature(key)
-            fix_layer_2.commitChanges()
-
-            for manual_fix in fix_layer_2.getFeatures(QgsFeatureRequest().setFilterExpression('Name = \'Curtis Bay Channel\' or Name = \'Canada - Georgian Bay 1\' or Name = \'Canada - Ontario - Parry Sound\'')):
-                if manual_fix["Name"] == "Canada - Georgian Bay 1":
-                    manualExtend(manual_fix, "Great Lakes - Huron 6")
-                elif manual_fix["Name"] == "Canada - Ontario - Parry Sound":
-                    manualExtend(manual_fix, "Canada - Georgian Bay 2")
-                else:
-                    manualExtend(manual_fix, "Baltimore Harbor, MD 15")
-            t1 = time.time()
-            progressUpdate(18, f"Split Waterway Lines Based On ChannelReach {t1 - startTime}")
-            if feedback.isCanceled():
-                return {} 
-
-        # Cut off overlapping geometries.
-        fix_layer_2.startEditing()
-        for to_shorten in fix_layer_2.getFeatures(QgsFeatureRequest().setFilterExpression("not is_empty($geometry)").setFilterExpression("overlay_intersects(@layer)")):
-            for overlap in fix_layer_2.getFeatures(QgsFeatureRequest().setFilterRect(to_shorten.geometry().boundingBox()).setFilterExpression("overlay_intersects(@layer)")):
-                if to_shorten.id() != overlap.id():
-                    g = to_shorten.geometry().intersection(overlap.geometry())
-                    if g.length() > DEFAULT_SEGMENT_EPSILON:
-                        to_shorten.setGeometry(to_shorten.geometry().difference(g))
-                        fix_layer_2.updateFeature(to_shorten)
-        fix_layer_2.commitChanges()
-        t1 = time.time()
-        progressUpdate(21, f"Cut off overlapping geometries {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-
-
-        #
-        # -------------------------- STEP 2 -------------------------
-        #
-
-        # 2a) Make sure distance is set to Miles in Project Properties
-        project.setDistanceUnits(QgsUnitTypes.DistanceMiles)
-        lines_layer = fix_layer_2.clone()
-        
-        # 2b) Open attributes table, abacus icon, update existing attribute, LenMiles, Geometry, re-calculate $length
-        lines_layer.startEditing()
-        for feature in lines_layer.getFeatures():
-            feature["LenMiles"] = round(distanceArea.convertLengthMeasurement(feature.geometry().length(), QgsUnitTypes.DistanceMiles), 4)
-            lines_layer.updateFeature(feature)
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(24, f"Recalculated length {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        # 2c) Correct linkType typos. Acceptable: (see list); flag Nulls - save flagged entries to a file and print to cmd.
-        linkTypes = ["CPT", "Centerline", "Coastal-connect", "Inland", "Great Lakes/St", "International", "Internat River"]
-        linkType_str = "'" + "', '".join(linkTypes) + "'"
-        expr = f"(LinkType not in ({ linkType_str }) or LinkType is NULL) AND NOT Name ILIKE '%Manual Connection%'"
-        lines_layer.startEditing()
-        for feature in lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr)):
-            linkType = str(feature["LinkType"])
-            if feature["LinkType"] == None:
-                flagged.append((feature["Name"], "Null LinkType"))
-            elif 'lock' not in linkType.lower():
-                matches = get_close_matches(linkType, linkTypes, n=1, cutoff=0.5)
-                if matches:
-                    feature["LinkType"] = matches[0]
-                    lines_layer.updateFeature(feature)
-                else:
-                    flagged.append((feature["Name"], "Invalid LinkType"))
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(27, f"Checked for LinkType typos {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        # 2d) Toolbox: "Create spatial index"
-        lines_layer = CreateSpatialIndex(lines_layer)
-        t1 = time.time()
-        progressUpdate(28, f"Created spatial index {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-
-
-        #
-        # -------------------------- STEP 3 -------------------------
-        #
-
-        # 3b) Remove empty and very short geometries (length <= 0.02mi)
-        lines_layer.startEditing()
-        for feature in lines_layer.getFeatures():
-            if (feature.geometry().isNull() or feature.geometry().isEmpty() or not feature.hasGeometry() or distanceArea.convertLengthMeasurement(feature.geometry().length(), QgsUnitTypes.DistanceMiles) <= min_geom_length) and not str(feature["Name"]).startswith('Manual Connection'):
-                lines_layer.deleteFeature(feature.id())
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(30, f"Removed empty & very short geometries {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        # 3c) Toolbox: Snap Geometries (End points only, tolerance = 0.0002 degrees)
-        null_geom_params = {
-            'INPUT': lines_layer,
-            'REMOVE_EMPTY': False,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        null_geom_result = processing.run("native:removenullgeometries", null_geom_params, is_child_algorithm=True, context=context)
-        null_geom_layer = context.getMapLayer(null_geom_result['OUTPUT'])
-        fix_param_4 = {
-            'INPUT': null_geom_layer,
-            'METHOD': 0,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        fix_result_4 = processing.run("native:fixgeometries", fix_param_4, is_child_algorithm=True, context=context)
-        fix_layer_4 = context.getMapLayer(fix_result_4['OUTPUT'])
-        snap_geometries_params = {
-            'INPUT': fix_layer_4,
-            'REFERENCE_LAYER': fix_layer_4,
-            'TOLERANCE': snapping_tolerance,
-            'BEHAVIOR': 6,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        snap_geometries_layer = processing.run("native:snapgeometries", snap_geometries_params, is_child_algorithm=True, context=context)
-        snap_geometries_layer = context.getMapLayer(snap_geometries_layer['OUTPUT'])
-        multi_to_single_params = {
-            'INPUT': snap_geometries_layer,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        multi_to_single_results = processing.run("native:multiparttosingleparts", multi_to_single_params, is_child_algorithm=True, context=context)
-        multi_to_single_layer = context.getMapLayer(multi_to_single_results['OUTPUT'])
-        t1 = time.time()
-        progressUpdate(33, f"Snapped geometries {t1 - startTime}")
-        if feedback.isCanceled():
-            return {}
-
-        # 3d) Run Disconnected Islands
-        disconnectedIslandsPlugin = DisconnectedIslands(multi_to_single_layer)
-        islands = []
-        (disconnected_layer, islands) = disconnectedIslandsPlugin.run(disconnected_islands_tolerance)
-
-        tolerance = snapping_tolerance
-        while islands:
-            mainland_layer = disconnected_layer.materialize(QgsFeatureRequest().setFilterExpression("networkGrp = 0"))
-            mainland_spIdx = QgsSpatialIndex(mainland_layer.getFeatures(), flags=QgsSpatialIndex.FlagStoreFeatureGeometries)
-            disconnected_layer.startEditing()
-            for island in islands:
-                min_dist = inf
-                expr = "networkGrp = " + str(island)
-                island_layer = disconnected_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr))
-                for island_feat in island_layer:
-                    main_neighbor = mainland_spIdx.nearestNeighbor(island_feat.geometry(), 1, tolerance)
-                    if main_neighbor:
-                        mainland_feat = mainland_layer.getFeature(main_neighbor[0])
-                        for p1 in [QgsPointXY(v) for v in island_feat.geometry().vertices()]:
-                            for p2 in [QgsPointXY(v) for v in mainland_feat.geometry().vertices()]:
-                                if QgsDistanceArea().measureLine(p1, p2) < min_dist:
-                                    min_dist = QgsDistanceArea().measureLine(p1, p2)
-                                    closest_island_feat = island_feat
-                                    closest_islandP = p1
-                                    closest_mainP = p2
-                if min_dist != inf:
-                    closest_island_feat.setGeometry(closest_island_feat.geometry().combine(QgsGeometry().fromPolylineXY([closest_islandP, closest_mainP])))
-                    disconnected_layer.updateFeature(closest_island_feat)
-            disconnected_layer.commitChanges()
-
-            multi_to_single_params = {
-                'INPUT': disconnected_layer,
-                'OUTPUT': 'TEMPORARY_OUTPUT'
-            }
-            multi_to_single_results = processing.run("native:multiparttosingleparts", multi_to_single_params, is_child_algorithm=True, context=context)
-            multi_to_single_layer = context.getMapLayer(multi_to_single_results['OUTPUT'])
-            
-            disconnectedIslandsPlugin = DisconnectedIslands(multi_to_single_layer)
-            islands = []
-            (disconnected_layer, islands) = disconnectedIslandsPlugin.run(disconnected_islands_tolerance)
-            tolerance += snapping_tolerance
-            if feedback.isCanceled():
-                return {}
-        
-        t1 = time.time()
-        progressUpdate(36, f"Reconnected disconnected islands {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-
-
-        #
-        # -------------------------- STEP 4 -------------------------
-        #
-        
-
-        # 4a) Join Channel_layer by location, 1-1 join type, maximum overlap
-        fix_param_3 = {
-            'INPUT': disconnected_layer,
-            'METHOD': 1,
-            'OUTPUT': 'TEMPORARY_OUTPUT'
-        }
-        fix_result_3 = processing.run("native:fixgeometries", fix_param_3, is_child_algorithm=True, context=context)
-        fix_layer_3 = context.getMapLayer(fix_result_3['OUTPUT'])
-        t1 = time.time()
-        progressUpdate(42, f" {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        uniqueFieldAdd(fix_layer_3, "ChannelRea", QVariant.String)
-        fix_layer_3.startEditing()
-        for ncf_feat in fix_layer_1.getFeatures():
-            for lines_feat  in fix_layer_3.getFeatures(QgsFeatureRequest().setFilterRect(ncf_feat.geometry().boundingBox())):
-                lines_feat.setAttribute("ChannelRea", ncf_feat["channelreachidpk"])
-                lines_feat.setAttribute("DepthFt", min(ncf_feat["depthmaintained"], 99))
-                fix_layer_3.updateFeature(lines_feat)
-        fix_layer_3.commitChanges()
-        t1 = time.time()
-        progressUpdate(45, f"Joined eHydro attributes by location {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-
-
-        #
-        # -------------------------- STEP 5 -------------------------
-        #
-
-        # 5a) For links with NCF data, depth = NCF depthmaintained
-        lines_layer = fix_layer_3.clone()
-        
-        # 5b) For all international links, depth = 99
-        lines_layer.startEditing()
-        for feat in lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression("LinkType = 'International' or LinkType = 'Internat River'")):
-            feat["DepthFt"] = 99
-            lines_layer.updateFeature(feat)
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(57, f"DepthFt attributes assigned {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        # 3a) Check for duplicate LinkIDs & names
-        unassignableIDs = [i for i in QgsVectorLayerUtils.getValues(lines_layer, "LinkId")[0] if search(r'9{5,}', str(i)) == None]
-        nextID = max(unassignableIDs) + 1
-        duplicateIDs = [item for item, count in Counter(QgsVectorLayerUtils.getValues(lines_layer, "LinkId")[0]).items() if count > 1]
-        duplicateNames = [item for item, count in Counter(QgsVectorLayerUtils.getValues(lines_layer, "Name")[0]).items() if count > 1]
-
-        lines_layer.startEditing()
-        for feat in lines_layer.getFeatures():
-            if feat["LinkId"] not in unassignableIDs or feat["LinkId"] in duplicateIDs:
-                feat["LinkId"] = nextID
-                lines_layer.updateFeature(feat)
-                nextID += 1
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(60, f"Checked for duplicate LinkIDs {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        lines_layer.startEditing()
-        for name in duplicateNames:
-            expr = f"Name = '{name}'"
-            for idx, feat in enumerate(lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression(expr))):
-                if idx != 0:
-                    feat["Name"] = name + ' ' + str(idx + 1)
-                    lines_layer.updateFeature(feat)
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(63, f" {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        lines_layer.startEditing()
-        for idx, feat in enumerate(lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression("Name IS NULL"))):
-            feat["Name"] = str(idx)
-            lines_layer.updateFeature(feat)
-        lines_layer.commitChanges()
-        t1 = time.time()
-        progressUpdate(66, f"Checked for duplicate names {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-        # Remove Plot, Domestic, Deepdraft attributes
-        if lines_layer.fields().indexFromName('Plot') != -1:
-            lines_layer.dataProvider().deleteAttributes([lines_layer.fields().indexFromName('Plot')])
-            lines_layer.updateFields()
-        if lines_layer.fields().indexFromName('Domestic') != -1:
-            lines_layer.dataProvider().deleteAttributes([lines_layer.fields().indexFromName('Domestic')])
-            lines_layer.updateFields()
-        if lines_layer.fields().indexFromName('Deepdraft') != -1:
-            lines_layer.dataProvider().deleteAttributes([lines_layer.fields().indexFromName('Deepdraft')])
-            lines_layer.updateFields()
-        t1 = time.time()
-        progressUpdate(78, f"Removed Plot, Domestic, Deepdraft attributes {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-
-
-
-        #
-        # -------------------------- STEP 6 -------------------------
-        #
-
-        date_str = date.today().strftime('%Y%m%d')
-        t1 = time.time()
-        progressUpdate(84, f" {t1 - startTime}")
-        if feedback.isCanceled():
-            return {} 
-        
-        # 6a) Use QGIS Networks plugin (Build Graph)
         nodes_params_1 = {
             'RESEAU': lines_layer,
             'SENS': '',
@@ -953,7 +965,7 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
         t1 = time.time()
         progressUpdate(87, f"Built Graph with Networks plugin {t1 - startTime}")
         if feedback.isCanceled():
-            return {} 
+            return {}
 
         # 5c) All others: deepest depth of surrounding neighbors
         def maxNeighborsDepth(layer):
@@ -966,16 +978,14 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                     nullDepth_feat["DepthFt"] = max(depths)
                     layer.updateFeature(nullDepth_feat)
             layer.commitChanges()
-        
         while list(lines_layer.getFeatures(QgsFeatureRequest().setFilterExpression("DepthFt IS NULL"))):
             maxNeighborsDepth(lines_layer)
             if feedback.isCanceled():
                 return {}
-            
         t1 = time.time()
         progressUpdate(90, f"Null DepthFt attributes estimated {t1 - startTime}")
         if feedback.isCanceled():
-            return {} 
+            return {}
 
         # 6b) Nodes: Add lat-lon attributes
         nodes_layer.dataProvider().addAttributes([QgsField("Latitude", QVariant.Double), QgsField("Longitude", QVariant.Double)])
@@ -990,14 +1000,23 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
         t1 = time.time()
         progressUpdate(93, f"Lat-lon attributes created & assigned to nodes {t1 - startTime}")
         if feedback.isCanceled():
-            return {} 
+            return {}
 
         # 6c) Create spatial index
-        lines_layer = CreateSpatialIndex(lines_layer)
+        processing.run("native:createspatialindex", {'INPUT': lines_layer})
         t1 = time.time()
         progressUpdate(96, f"Created spatial index {t1 - startTime}")
         if feedback.isCanceled():
-            return {} 
+            return {}
+
+        state_exists = False
+        if self.parameterAsVectorLayer(parameters, 'STATE_INPUT', context) != None:
+            state_layer = self.parameterAsVectorLayer(parameters, 'STATE_INPUT', context)
+            if state_layer is None or QgsWkbTypes.geometryType(state_layer.wkbType()) != QgsWkbTypes.PolygonGeometry or state_layer.featureCount() == 0:
+                raise QgsProcessingException("State layer failed to load!")
+            state_exists = True
+        state_abbr = self.parameterAsString(parameters, 'STATE_ABBR', context)
+        state_fips = self.parameterAsString(parameters, 'STATE_FIPS', context)
 
         # 6d) Nodes: Add "State abbreviation/FIPS", "County Name" attributes       
         if state_exists and state_abbr != '' and state_fips != '':
@@ -1024,10 +1043,19 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                         nodes_feat.setAttribute("StateFIPS", state_feat[state_fips])
                         nodes_layer.updateFeature(nodes_feat)
             nodes_layer.commitChanges()
-            t1 = time.time()
-            progressUpdate(97, f"State Abbreviation/FIPS attributes created & assigned to nodes {t1 - startTime}")
-            if feedback.isCanceled():
-                return {} 
+        t1 = time.time()
+        progressUpdate(97, f"State Abbreviation/FIPS attributes created & assigned to nodes {t1 - startTime}")
+        if feedback.isCanceled():
+            return {} 
+
+        county_exists = False
+        if self.parameterAsVectorLayer(parameters, 'COUNTY_INPUT', context) != None:
+            county_layer = self.parameterAsVectorLayer(parameters, 'COUNTY_INPUT', context)
+            if county_layer is None or QgsWkbTypes.geometryType(county_layer.wkbType()) != QgsWkbTypes.PolygonGeometry or county_layer.featureCount() == 0:
+                raise QgsProcessingException("County layer failed to load!")
+            county_exists = True
+        county_name = self.parameterAsString(parameters, 'COUNTY_NAME', context)
+        county_fips = self.parameterAsString(parameters, 'COUNTY_FIPS', context)
 
         if county_exists and county_name != '' and county_fips != '':
             nodes_layer.dataProvider().addAttributes([QgsField("CountyName", QVariant.String), QgsField("CountyFIPS", QVariant.Int)])
@@ -1053,10 +1081,18 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                         nodes_feat.setAttribute("CountyFIPS", county_feat[county_fips])
                         nodes_layer.updateFeature(nodes_feat)
             nodes_layer.commitChanges()
-            t1 = time.time()
-            progressUpdate(98, f"County Name attributes created & assigned to nodes {t1 - startTime}")
-            if feedback.isCanceled():
-                return {}
+        t1 = time.time()
+        progressUpdate(98, f"County Name attributes created & assigned to nodes {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
+            
+        country_exists = False
+        if self.parameterAsVectorLayer(parameters, 'COUNTRY_INPUT', context) != None:
+            country_layer = self.parameterAsVectorLayer(parameters, 'COUNTRY_INPUT', context)
+            if country_layer is None or QgsWkbTypes.geometryType(country_layer.wkbType()) != QgsWkbTypes.PolygonGeometry or country_layer.featureCount() == 0:
+                raise QgsProcessingException("Country layer failed to load!")
+            country_exists = True
+        country_abbr = self.parameterAsString(parameters, 'COUNTRY_ABBR', context)
 
         if country_exists and country_abbr != '':
             nodes_layer.dataProvider().addAttributes([QgsField("CountryAbbr", QVariant.String)])
@@ -1081,10 +1117,22 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
                         nodes_feat.setAttribute("CountryAbbr", country_feat[country_abbr])
                         nodes_layer.updateFeature(nodes_feat)
             nodes_layer.commitChanges()
-            t1 = time.time()
-            progressUpdate(99, f"Country Abbreviation/FIPS attributes created & assigned to nodes {t1 - startTime}")
-            if feedback.isCanceled():
-                return {}
+        
+        del Networks
+        del networkPlugin
+        del point
+        del state_exists
+        del state_abbr
+        del state_fips
+        del county_exists
+        del county_name
+        del county_fips
+        del country_exists
+        del country_abbr
+        t1 = time.time()
+        progressUpdate(99, f"Country Abbreviation/FIPS attributes created & assigned to nodes {t1 - startTime}")
+        if feedback.isCanceled():
+            return {}
 
 
 
@@ -1132,6 +1180,7 @@ class QualityControlAlgorithm(QgsProcessingAlgorithm):
         (node_sink, node_dest_id) = self.parameterAsSink(parameters, 'NODE_OUTPUT', context, nodes_layer.fields(), nodes_layer.wkbType(), nodes_layer.sourceCrs())
         
         #https://gis.stackexchange.com/questions/415841/changing-output-layers-name-in-qgis-processing-plugin
+        date_str = date.today().strftime('%Y%m%d')
         link_layer_details = context.layerToLoadOnCompletionDetails(link_dest_id)
         link_layer_details.name = f"{date_str}_network_links"
         node_layer_details = context.layerToLoadOnCompletionDetails(node_dest_id)
