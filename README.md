@@ -67,7 +67,7 @@ After a user introduces desired changes to a line layer representing the waterwa
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org/) (SemVer) principles to ensure consistent and predictable version numbering. The version number is automatically incremented on every commit or merge to the `main` branch based on commit message conventions.
+This project follows [Semantic Versioning](https://semver.org/) (SemVer) principles to ensure consistent and predictable version numbering. The version number is automatically incremented on every commit or merge to the `main` branch based on commit message conventions. Releases are only automatically made for minor or major version updates.
 
 ### Version Increment Rules
 
