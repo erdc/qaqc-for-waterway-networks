@@ -2,17 +2,22 @@
 
 Developed by:  
 Connor Hicks  
-Junior Software Engineer, ARA
+Junior Software Engineer
+Applied Research Associates, Inc. (ARA)
 
 Magdalena Asborno, PhD  
 Senior Consultant, ARA  
 Research Civil Engineer, USACE-ERDC
 
+Paul Patorno   
+Sotware Engineer   
+Applied Research Associates, Inc. (ARA)
+
 ## Cite this work
 
 If you use this work, please add this citation:
 
-Asborno, M., C. Hicks, and K. N. Mitchell. 2025. Quality Control for Waterway Network ERDC/CHL CHETN-IX-22677. Vicksburg, MS: US Army Engineer Research and Development Center, Coastal and Hydraulics Laboratory. DOI forthcoming
+Asborno, M., C. Hicks, K. N. Mitchell, and P. Patorno. 2025. Quality Control for Waterway Networks. ERDC-CHL CHETN-IX-72. Vicksburg, MS: US Army Engineer Research and Development Center, Coastal and Hydraulics Laboratory. http://dx.doi.org/10.21079/11681/49939.
 
 ## Licensing
 
