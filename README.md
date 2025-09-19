@@ -2,7 +2,7 @@
 
 Developed by:  
 Connor Hicks  
-Junior Software Engineer
+Junior Software Engineer   
 Applied Research Associates, Inc. (ARA)
 
 Magdalena Asborno, PhD  
@@ -11,7 +11,7 @@ Research Civil Engineer, USACE-ERDC
 
 Paul Patorno   
 Sotware Engineer   
-Applied Research Associates, Inc. (ARA)
+Applied Research Associates, Inc.
 
 ## Cite this work
 
