@@ -933,12 +933,20 @@ def set_ehydro_and_cpt_attributes(layer, ncf_layer):
 
             # Decide once per line, after examining all candidates
             if best_feat is not None and best_ratio > 0.5:
-                line_feat.setAttribute(chan_idx, best_feat["channelreachidpk"])
-                if depth_idx != -1:
-                    line_feat.setAttribute(
-                        depth_idx,
-                        (best_feat["depthmaintained"] or 99)
-                    )
+                try:
+                    line_feat.setAttribute(chan_idx, best_feat["channelreachidpk"])
+                    if depth_idx != -1:
+                        line_feat.setAttribute(
+                            depth_idx,
+                            (best_feat["depthmaintained"] or 99)
+                        )
+                except:
+                    line_feat.setAttribute(chan_idx, best_feat["channelrea"])
+                    if depth_idx != -1:
+                        line_feat.setAttribute(
+                            depth_idx,
+                            (best_feat["depthmaint"] or 99)
+                        )
             else:
                 line_feat.setAttribute(chan_idx, None)
 
